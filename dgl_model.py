@@ -16,8 +16,7 @@ class overAll(nn.Module):
                  device='cpu'
                  ):
         super(overAll, self).__init__()
-        self.e_encoder = Dual(depth=depth, device=device)
-        self.r_encoder = Dual(depth=depth, device=device)
+        self.encoder = MRAEA(depth=depth, device=device)
         self.device = device
         self.dropout_rate = dropout_rate
         self.depth = depth
@@ -61,38 +60,54 @@ class overAll(nn.Module):
         r_temp_block.update_all(fn.copy_u('rel_emb', 'm'), fn.mean('m', 'r_neigh'), etype='link')
         rel_feature = r_temp_block.dstnodes['entity'].data['r_neigh']
 
-
-        out_feature_ent = self.e_encoder(blocks, self.g_r, ent_feature, self.rel_emb)
-        out_feature_rel = self.r_encoder(blocks, self.g_r, rel_feature, self.rel_emb)
-        out_feature = torch.cat((out_feature_ent, out_feature_rel), dim=-1)
+        feature = torch.cat([ent_feature, rel_feature], dim=1)
+        out_feature = self.encoder(blocks, self.g_r, feature, self.rel_emb)
+        # out_feature_rel = self.r_encoder(blocks, self.g_r, rel_feature, self.rel_emb)
+        # out_feature = torch.cat((out_feature_ent, out_feature_rel), dim=-1)
 
         out_feature = F.dropout(out_feature, p=self.dropout_rate, training=self.training)
         return out_feature
 
-class Dual(nn.Module):
+class MRAEA(nn.Module):
     def __init__(self,
-                 use_bias=True,
+                 use_bias=False,
                  depth=1,
-                 activation=torch.tanh,
-                 device='cpu'
+                 activation=F.relu,
+                 device='cpu',
+                 attn_heads_reduction='mean',
+                 attn_heads=2
                  ):
-        super(Dual, self).__init__()
+        super(MRAEA, self).__init__()
 
         self.activation = activation
         self.depth = depth
         self.use_bias = use_bias
         self.attn_kernels = []
+        self.biases = []
+        
+        # adding
+        self.attn_heads_reduction = attn_heads_reduction
+        self.attn_heads = attn_heads
 
         dim = 100
 
         node_F = dim
         rel_F = dim
-        self.ent_F = node_F
+        self.ent_F = node_F + rel_F
         ent_F = self.ent_F
 
-        for d in range(self.depth):
-            attn_kernel = overAll.init_emb(3 * node_F, 1)
-            self.attn_kernels.append(attn_kernel.to(device))
+        # different from RREA & DUAL
+        # using the same kernel for each layer(hop)
+        for head in range(self.attn_heads):
+            # todo attn_kernel seems different
+            if self.use_bias:
+                bias = overAll.init_emb(ent_F, 1, init_func='xavier')
+                self.biases.append(bias)
+            attn_kernel_self = overAll.init_emb(ent_F, 1)
+            attn_kernel_neighs = overAll.init_emb(ent_F, 1)
+            attn_kernel_rels = overAll.init_emb(rel_F, 1)
+            attn_kernel = [attn_kernel_self, attn_kernel_neighs, attn_kernel_rels]
+            self.attn_kernels.append([x.to(device) for x in attn_kernel])
 
 
     def forward(self, blocks, g_r: dgl.heterograph, features, rel_emb):
@@ -102,38 +117,53 @@ class Dual(nn.Module):
         dst_nodes = blocks[-1].dstdata[dgl.NID]
         outputs.append(features[:len(dst_nodes)])
         for l in range(self.depth):
-            attention_kernel = self.attn_kernels[l]
+            features_list = []
+            for head in range(self.attn_heads):
+                attention_kernel = self.attn_kernels[head]
+                # compute attention for rel
 
-            # compute rels_sum
-            eid = blocks[l].edata[dgl.EID]
-            g_r.nodes['relation'].data['features'] = rel_emb
-            temp_block = MultiLayerFullNeighborSampler(1).sample_blocks(g_r, {'index': eid})[0]
-            temp_block.update_all(fn.copy_u('features', 'm'), fn.mean('m', 'emb'), etype='in')
-            rels_sum = F.normalize(temp_block.dstnodes['index'].data['emb'], p=2, dim=1)
-            blocks[l].srcdata['features'] = features
-            blocks[l].apply_edges(fn.copy_u('features', 'neighs'))
-            neighs = blocks[l].edata['neighs']
+                eid = blocks[l].edata[dgl.EID]
+                g_r.nodes['relation'].data['features'] = torch.matmul(rel_emb, attention_kernel[2])
+                temp_block = MultiLayerFullNeighborSampler(1).sample_blocks(g_r, {'index': eid})[0]
+                temp_block.update_all(fn.copy_u('features', 'm'), fn.mean('m', 'att'), etype='in')
+                attn_for_rels = temp_block.dstnodes['index'].data['att']
 
-            # add self
-            src, trg = blocks[l].edges()
-            selfs = features[trg]
-            # neighs = features[src]
 
-            # different from dual
-            neighs = neighs- 2*torch.sum(neighs * rels_sum, 1, keepdim=True) * rels_sum
-            new_conbine = torch.cat([selfs, neighs, rels_sum], dim=1)
-            att1 = torch.squeeze(torch.matmul(new_conbine, attention_kernel), dim=-1)
+                # blocks[l].srcdata['features'] = features
+                # blocks[l].apply_edges(fn.copy_u('features', 'neighs'))
+                # neighs = blocks[l].edata['neighs']
+    
+                # add self
+                src, trg = blocks[l].edges()
+                selfs = features[trg]
+                neighs = features[src]
 
-            from dgl.nn.functional import edge_softmax
-            att = edge_softmax(blocks[l], att1.flatten(), norm_by='dst')
-            new_feature = neighs * torch.unsqueeze(att, dim=-1)
-            blocks[l].edata['feat'] = new_feature
-            blocks[l].update_all(fn.copy_e('feat', 'm'), fn.sum('m', 'layer'+str(l)))
-            features = blocks[l].dstdata['layer' + str(l)]
 
+                attn_for_neighs = torch.matmul(neighs, attention_kernel[1])
+
+                attn_for_selfs = torch.matmul(selfs, attention_kernel[0])
+                att = attn_for_rels + attn_for_selfs + attn_for_neighs
+                att = F.leaky_relu(att)
+
+
+                from dgl.nn.functional import edge_softmax
+                att = edge_softmax(blocks[l], att, norm_by='dst')
+                new_feature = neighs * att
+                blocks[l].edata['feat'] = new_feature
+                blocks[l].update_all(fn.copy_e('feat', 'm'), fn.sum('m', 'layer'+str(l)))
+                dst_features = blocks[l].dstdata['layer' + str(l)]
+    
+
+
+                features_list.append(dst_features)
+            if self.attn_heads_reduction == 'concat':
+                features = torch.cat(features_list, dim=1)
+            else:
+                features = torch.mean(torch.stack(features_list), dim=0)
             features = self.activation(features)
             dst_nodes = blocks[-1].dstdata[dgl.NID]
-            outputs.append(features[:len(dst_nodes)])   # only append dst node
-
+            outputs.append(features[:len(dst_nodes)])
+        
+        # deal with layer
         outputs = torch.cat(outputs, dim=1)
         return outputs

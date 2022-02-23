@@ -89,9 +89,13 @@ def load_data(lang,train_ratio = 0.3):
 
     return np.array(train_pair),np.array(test_pair),adj_matrix,np.array(r_index),np.array(r_val),adj_features,rel_features
 
-def get_hits(vec, test_pair, top_k=(1, 5, 10)):
-    Lvec = np.array([vec[e1] for e1, e2 in test_pair])
-    Rvec = np.array([vec[e2] for e1, e2 in test_pair])
+def get_hits(vec=None, test_pair=None, top_k=(1, 5, 10), given=False, L=None, R=None):
+    if given:
+        Lvec = L
+        Rvec = R
+    else:
+        Lvec = np.array([vec[e1] for e1, e2 in test_pair])
+        Rvec = np.array([vec[e2] for e1, e2 in test_pair])
     
     Lvec = Lvec / np.linalg.norm(Lvec,axis=-1,keepdims=True)
     Rvec = Rvec / np.linalg.norm(Rvec,axis=-1,keepdims=True)

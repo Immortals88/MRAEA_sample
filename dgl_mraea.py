@@ -16,8 +16,8 @@ sess = tf.compat.v1.Session(config=config)
 tf.compat.v1.keras.backend.set_session(sess)
 
 
-lang = 'zh'
-train_pair, dev_pair, adj_matrix, r_index, r_val, adj_features, rel_features = load_data('data/%s_en/' % lang,
+lang = 'de'
+train_pair, test_pair, adj_matrix, r_index, r_val, adj_features, rel_features = load_data('data/en_%s_15k_V1/mapping/0_3/' % lang,
                                                                                          train_ratio=0.30)
 
 adj_matrix = np.stack(adj_matrix.nonzero(), axis=1)
@@ -27,19 +27,22 @@ ent_matrix, ent_val = np.stack(adj_features.nonzero(), axis=1), adj_features.dat
 node_size = adj_features.shape[0]
 rel_size = rel_features.shape[1]
 triple_size = len(adj_matrix) # not triple size, but number of diff(h, t)
+
+batch_size = 1000
 node_hidden = 100
 rel_hidden = 100
-batch_size = 5000
 
 dropout_rate = 0.3
 lr = 0.005
-gamma = 1
+# todo head
+n_attn_heads = 2
+gamma = 3
 depth = 2
 device = 'cuda'
 
 # newly add
 fanouts = [8] * depth
-eval_bs = 100000
+eval_bs = 10000
 neg_bs = batch_size*2
 filter_link = True
 
@@ -54,9 +57,7 @@ if filter_link:
             ent_1.add(link[1])
             filtered.append(link)
     print(f'remain ratio = {len(filtered)/len(train_pair)}')
-    print(train_pair)
     train_pair = np.array(filtered)
-    print(train_pair)
 
 @torch.no_grad()
 def get_embedding(index_a, index_b, vec=None):
@@ -93,6 +94,7 @@ def align_loss(batch_size, neg_size, embedding):
     right = torch.tensor(range(batch_size, batch_size + batch_size))
     # print(left, right)
 
+
     l_emb = embedding[left]
     r_emb = embedding[right]
     node_size = 2 * batch_size + neg_size
@@ -123,7 +125,6 @@ def align_loss(batch_size, neg_size, embedding):
     r_loss = torch.logsumexp(lamb * r_loss + tau, dim=-1)
     return torch.mean(l_loss + r_loss)
 
-    return fuck
 
 def constructRelGraph(r_index, rel_size):
     src, trg = [], []
@@ -167,7 +168,6 @@ n_r = constructNode_Rel_interact(rel_matrix)
 g_r = g_r.to(device)
 n_r = n_r.to(device)
 
-
 print('begin')
 #inputs = [adj_input, index_input, val_input, rel_adj, ent_adj]
 
@@ -180,9 +180,9 @@ model = model.to(device)
 opt = torch.optim.Adam(model.parameters(), lr=lr)
 print('model constructed')
 
-# evaluater = evaluate(dev_pair)
-rest_set_1 = [e1 for e1, e2 in dev_pair]
-rest_set_2 = [e2 for e1, e2 in dev_pair]
+# evaluater = evaluate(test_pair)
+rest_set_1 = [e1 for e1, e2 in test_pair]
+rest_set_2 = [e2 for e1, e2 in test_pair]
 np.random.shuffle(rest_set_1)
 np.random.shuffle(rest_set_2)
 
@@ -202,8 +202,6 @@ def dataloader(train_pair, batch_size, node_size, neg_bs = None):
         l = i * batch_size
         r = l +batch_size if l + batch_size < len(train_pair) else len(train_pair)
         pairs = train_pair[l: r]
-
-
         # node ID of two KGs is not overlapping
         l_n = i * n_bs
         r_n = l_n + n_bs if l_n + n_bs < len(neg_node) else len(neg_node)
@@ -213,50 +211,29 @@ def dataloader(train_pair, batch_size, node_size, neg_bs = None):
 
 # here is dual-m
 epoch = 50
-for turn in range(1):
-    for i in trange(epoch):
-        np.random.shuffle(train_pair)
-        for pairs, neg_node in dataloader(train_pair, batch_size, node_size, neg_bs):
-            pos_node = np.hstack((pairs[:, 0], pairs[:, 1]))
-            seed = np.hstack((pos_node, neg_node))
 
-            # print(len(seed))
-            # print(len(set(seed)))
-            # s_p_0 = set(pairs[:, 0])
-            # s_p_1 = set(pairs[:, 1])
-            # print(f'left:{len(s_p_0)}, right:{len(s_p_1)}')
-            # print(f'len of pos node:{len(pos_node)}, len of uni pos:{len(s_p_1.union(s_p_0))}')
+for i in trange(epoch):
+    np.random.shuffle(train_pair)
+    for pairs, neg_node in dataloader(train_pair, batch_size, node_size, neg_bs):
+        pos_node = np.hstack((pairs[:, 0], pairs[:, 1]))
+        seed = np.hstack((pos_node, neg_node))
 
-            blocks = MultiLayerNeighborSampler(fanouts, return_eids=True).sample_blocks(g, torch.from_numpy(seed))
-            # print('block', blocks)
-            blocks = [block.to(device) for block in blocks]
-            output = model(blocks)
-            loss = align_loss(len(pairs), neg_bs, output)
-            print(loss)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-        # if i %10 == 9:
+        blocks = MultiLayerNeighborSampler(fanouts, return_eids=True).sample_blocks(g, torch.from_numpy(seed))
+
+        blocks = [block.to(device) for block in blocks]
+        output = model(blocks)
+        loss = align_loss(len(pairs), neg_bs, output)
+        print(loss)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    if i %10 == 9:
         model.eval()
-        Lvec, Rvec = get_embedding(dev_pair[:, 0], dev_pair[:, 1])
+        Lvec, Rvec = get_embedding(test_pair[:, 0], test_pair[:, 1])
         from utils import get_hits
-        get_hits(Lvec, Rvec, np.array(list( zip(range(len(Lvec)), range(len(Rvec))))))
+        get_hits(test_pair=test_pair, given=True, L=Lvec, R=Rvec)
         model.train()
-        new_pair = []
-    model.eval()
-    Lvec, Rvec = get_embedding(rest_set_1, rest_set_2)
-    model.train()
-    # A, B = evaluater.CSLS_cal(Lvec, Rvec, False)
-    # for i, j in enumerate(A):
-    #     if B[j] == i:
-    #         new_pair.append([rest_set_1[j], rest_set_2[i]])
-    #
-    # train_pair = np.concatenate([train_pair, np.array(new_pair)], axis=0)
-    # for e1, e2 in new_pair:
-    #     if e1 in rest_set_1:
-    #         rest_set_1.remove(e1)
-    #
-    # for e1, e2 in new_pair:
-    #     if e2 in rest_set_2:
-    #         rest_set_2.remove(e2)
-    # epoch = 5
+new_pair = []
+model.eval()
+Lvec, Rvec = get_embedding(rest_set_1, rest_set_2)
+model.train()
